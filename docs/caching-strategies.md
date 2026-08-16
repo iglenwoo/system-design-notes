@@ -36,6 +36,9 @@ All code examples use **FastAPI + MySQL (aiomysql) + Redis (redis-py asyncio)**.
 
 Every example below assumes this wiring.
 
+<details>
+<summary><code>app/deps.py</code> — Redis client and MySQL pool</summary>
+
 ```python
 # app/deps.py
 import os
@@ -75,6 +78,11 @@ def pool() -> aiomysql.Pool:
     return _pool
 ```
 
+</details>
+
+<details>
+<summary><code>app/main.py</code> — lifespan wiring</summary>
+
 ```python
 # app/main.py
 from contextlib import asynccontextmanager
@@ -92,7 +100,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 ```
 
+</details>
+
 Table used throughout:
+
+<details>
+<summary><code>users</code> table schema</summary>
 
 ```sql
 CREATE TABLE users (
@@ -102,6 +115,8 @@ CREATE TABLE users (
   updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 ```
+
+</details>
 
 ---
 
@@ -155,6 +170,9 @@ Check cache → on miss, query DB → write result back into cache. The cache ne
 READ:  app → cache (miss) → DB → app writes cache → return
 ```
 
+<details>
+<summary><code>app/cache_aside.py</code> — read path</summary>
+
 ```python
 # app/cache_aside.py
 import json
@@ -195,6 +213,8 @@ async def get_user(user_id: int) -> dict:
     return row
 ```
 
+</details>
+
 The write half of what people call "cache-aside" is [write-around](#6-write-around) — see §6.
 
 **Resilience note:** if Redis is down, every read degrades to a DB query. Slower, but not an outage. That property is worth more than it sounds, and write-behind is the one strategy that gives it up.
@@ -217,6 +237,9 @@ Read-through:  app → cache (miss → cache loads from DB itself) → app
 Observable behavior is nearly identical to cache-aside. The difference is **where the loading logic lives**. Read-through centralizes it, so every caller inherits the same TTL, serialization, negative caching, and stampede protection without having to remember any of it.
 
 Redis cannot do this natively — it has no MySQL connector. App-level "read-through" with Redis means a wrapper that owns the loader function:
+
+<details>
+<summary><code>app/read_through.py</code> — the cache owns the loader</summary>
 
 ```python
 # app/read_through.py
@@ -260,6 +283,11 @@ user_cache = ReadThroughCache(
 )
 ```
 
+</details>
+
+<details>
+<summary>Route using the read-through cache</summary>
+
 ```python
 @router.get("/users/{user_id}")
 async def get_user(user_id: int) -> dict:
@@ -268,6 +296,8 @@ async def get_user(user_id: int) -> dict:
         raise HTTPException(status_code=404, detail="user not found")
     return user
 ```
+
+</details>
 
 `aiocache`'s `@cached` decorator is essentially this pattern packaged.
 
@@ -302,6 +332,9 @@ Redis has no native write-through to MySQL, so in practice you implement it in t
 ### Ordering: DB first, then cache
 
 Write DB first. The inverse means a DB failure leaves the cache advertising a value that was never persisted — a lie that survives until TTL.
+
+<details>
+<summary><code>app/write_through.py</code> — DB commit, then cache set</summary>
 
 ```python
 # app/write_through.py
@@ -352,6 +385,8 @@ async def write_through_update(user_id: int, body: SettingsUpdate) -> dict:
     return record
 ```
 
+</details>
+
 ### The dual-write consistency risk
 
 Two systems, one logical write, no shared transaction. Three failure shapes:
@@ -387,6 +422,9 @@ WRITE:  app → cache (ack immediately)
 Write latency becomes one Redis round-trip. Throughput improves further because N individual `INSERT`s collapse into one multi-row `INSERT` — fewer round-trips, fewer fsyncs, less lock contention.
 
 ### Producer: the FastAPI endpoint
+
+<details>
+<summary><code>app/write_behind.py</code> — producer endpoint</summary>
 
 ```python
 # app/write_behind.py
@@ -425,11 +463,16 @@ async def record_event(event: Event) -> dict:
     return {"status": "accepted"}
 ```
 
+</details>
+
 `202 Accepted` is the honest status code. The write is buffered, not durable.
 
 ### Consumer: the flush worker
 
 A separate process — not a FastAPI background task. It must survive independently of the web process.
+
+<details>
+<summary><code>worker/flush.py</code> — batched flush worker</summary>
 
 ```python
 # worker/flush.py
@@ -500,6 +543,8 @@ if __name__ == "__main__":
     asyncio.run(run())
 ```
 
+</details>
+
 Two details that matter:
 
 - **`LMOVE` to an in-flight list, not `LPOP`.** A plain `LPOP` followed by a crash before `commit()` silently drops the batch. The in-flight list plus `recover_inflight()` gives at-least-once delivery — so make the DB write idempotent (natural key + `INSERT IGNORE` or `ON DUPLICATE KEY UPDATE`) if duplicates would be harmful.
@@ -534,6 +579,9 @@ Write straight to the database, then **delete** the cache key. The next read rep
 WRITE:  app → DB → app DELETEs cache key
 ```
 
+<details>
+<summary>Write-around update — commit, then <code>DELETE</code> the key</summary>
+
 ```python
 @router.put("/users/{user_id}")
 async def update_user(user_id: int, display_name: str) -> dict:
@@ -548,6 +596,8 @@ async def update_user(user_id: int, display_name: str) -> dict:
     await redis_client.delete(user_key(user_id))
     return {"id": user_id, "display_name": display_name}
 ```
+
+</details>
 
 ### Why delete instead of update?
 
@@ -598,6 +648,9 @@ The ⚠️ cells aren't forbidden — they're where write-behind's "cache is the
 
 Per-entity, not per-application:
 
+<details>
+<summary>Per-entity strategy picks</summary>
+
 ```python
 # Profiles: read-heavy, staleness fine
 #   → cache-aside + write-around
@@ -611,6 +664,8 @@ Per-entity, not per-application:
 # Static assets: someone else's cache
 #   → read-through (CDN) + write-around (purge on deploy)
 ```
+
+</details>
 
 Choosing one strategy for an entire service is the actual mistake. The unit of choice is the entity.
 
@@ -639,11 +694,16 @@ Four mitigations follow, roughly in order of cost. **Do 8.1 always.** Add the ot
 
 The cheapest fix by a wide margin, and it addresses the most common trigger: keys populated together expire together.
 
+<details>
+<summary>TTL jitter — two lines</summary>
+
 ```python
 import random
 
 await redis_client.set(key, json.dumps(row), ex=TTL_SECONDS + random.randint(0, 60))
 ```
+
+</details>
 
 A cache warmed by a deploy, a batch job, or a traffic spike has thousands of keys with identical expiry timestamps. Jitter smears them across a window so the herd never forms. Two lines, no coordination, no new failure modes. If you take one thing from Part II, take this.
 
@@ -652,6 +712,9 @@ Jitter does not help a *single* key that's hot enough to stampede on its own —
 ### 8.2 Single-flight, in-process (`asyncio.Future`)
 
 Exactly one request executes the expensive load; every other request for that key waits and shares the result. Within one Python process, a dict of in-flight futures is enough.
+
+<details>
+<summary><code>app/singleflight.py</code> — in-process coalescing</summary>
 
 ```python
 # app/singleflight.py
@@ -693,6 +756,11 @@ async def get_single_flight(
         _inflight.pop(key, None)
 ```
 
+</details>
+
+<details>
+<summary>Route using single-flight</summary>
+
 ```python
 @router.get("/users/{user_id}")
 async def get_user(user_id: int) -> dict:
@@ -705,6 +773,8 @@ async def get_user(user_id: int) -> dict:
     return user
 ```
 
+</details>
+
 Notes:
 
 - Register the future in `_inflight` **before** the first `await` inside the critical section. asyncio gives no preemption between those two statements, which is what makes the check-then-set safe here.
@@ -716,6 +786,9 @@ Notes:
 ### 8.3 Single-flight, distributed (Redis `SET NX EX`)
 
 To coalesce across processes and hosts, the lock has to live where everyone can see it.
+
+<details>
+<summary><code>app/distributed_singleflight.py</code> — Redis-lock coalescing</summary>
 
 ```python
 # app/distributed_singleflight.py
@@ -790,6 +863,8 @@ async def get_coalesced(
     return await loader()
 ```
 
+</details>
+
 Every failure mode this handles, and why each line exists:
 
 | Scenario | Behavior |
@@ -827,6 +902,9 @@ Both avoid the cold window entirely rather than serializing access to it.
 
 **Probabilistic early expiration (XFetch)** — refresh before expiry, with probability rising as expiry nears. No key is ever cold.
 
+<details>
+<summary>XFetch — probabilistic early expiration</summary>
+
 ```python
 import math
 import random
@@ -860,9 +938,14 @@ async def get_xfetch(key: str, loader, ttl: int = TTL_SECONDS) -> dict | None:
     return value
 ```
 
+</details>
+
 Expensive keys (large `delta`) get refreshed earlier than cheap ones, automatically.
 
 **Stale-while-revalidate** — serve the expired value immediately, refresh in the background. Store the value with a TTL longer than its logical freshness, and keep the freshness deadline inside the payload:
+
+<details>
+<summary>Stale-while-revalidate</summary>
 
 ```python
 async def _refresh(key: str, loader, fresh_for: int, serve_stale_for: int):
@@ -884,6 +967,8 @@ async def get_swr(key: str, loader, fresh_for: int = 300, serve_stale_for: int =
         return entry["value"]                         # stale, but instant
     return await _refresh(key, loader, fresh_for, serve_stale_for)
 ```
+
+</details>
 
 Zero-latency reads, bounded staleness. Two things to get right: hold a reference to the `create_task` handle (a bare task can be garbage-collected mid-flight), and route `_refresh` through single-flight (§8.2) so the background refreshes don't stampede either — otherwise every stale read spawns its own loader.
 
@@ -907,6 +992,9 @@ Symptoms: one node's CPU pinned while the rest idle; `redis-cli --hotkeys` or `O
 
 The most effective fix, and usually enough. Cache the hot key *in-process* with a very short TTL. Redis becomes L2.
 
+<details>
+<summary><code>app/l1.py</code> — L1 cache in front of Redis</summary>
+
 ```python
 # app/l1.py
 import time
@@ -927,6 +1015,8 @@ async def get_with_l1(key: str, loader, ttl: int = TTL_SECONDS) -> Any:
     return value
 ```
 
+</details>
+
 A 1-second L1 TTL caps Redis traffic for that key at **one request per second per process**, regardless of incoming rate. 50k req/s across 24 processes becomes 24 req/s. The cost is up to 1s of extra staleness — usually irrelevant for exactly the kind of data that gets this hot (trending lists, feature flags, config).
 
 Bound the dict (`cachetools.TTLCache(maxsize=...)`) so it can't grow without limit.
@@ -934,6 +1024,9 @@ Bound the dict (`cachetools.TTLCache(maxsize=...)`) so it can't grow without lim
 ### 9.2 Key splitting
 
 When even L1 isn't enough, or the value must stay fresher than an L1 TTL allows: write the same value under N suffixed keys, read a random one. Spreads load across N slots.
+
+<details>
+<summary>Key splitting across N replicas</summary>
 
 ```python
 HOT_REPLICAS = 16
@@ -953,6 +1046,8 @@ async def get_split(base_key: str, loader, ttl: int = TTL_SECONDS):
     await pipe.execute()
     return value
 ```
+
+</details>
 
 Tradeoff: N× memory, and invalidation must now delete N keys. Use only for genuinely hot keys, not by default.
 
@@ -1018,6 +1113,9 @@ Two patterns that work:
 
 **Version-prefixed keys** — bump a version counter; old keys become unreachable and expire on their own.
 
+<details>
+<summary>Version-prefixed keys</summary>
+
 ```python
 async def user_ns(user_id: int) -> str:
     v = await redis_client.get(f"ver:user:{user_id}") or "0"
@@ -1028,9 +1126,14 @@ async def invalidate_user(user_id: int) -> None:
     await redis_client.incr(f"ver:user:{user_id}")   # O(1), no scanning
 ```
 
+</details>
+
 Cost: orphaned keys linger until TTL, occupying memory. Fine on an `allkeys-lru` instance — they're the coldest keys, so they're evicted first.
 
 **Tag sets** — maintain a Redis set of keys per tag, delete the members.
+
+<details>
+<summary>Tag sets</summary>
 
 ```python
 async def tag(tag_name: str, key: str) -> None:
@@ -1042,6 +1145,8 @@ async def invalidate_tag(tag_name: str) -> None:
     if keys:
         await redis_client.delete(*keys, f"tag:{tag_name}")
 ```
+
+</details>
 
 Exact, but the tag set is itself a key that can be evicted — losing it means losing the ability to invalidate its members. Put tag sets on a `noeviction` instance or accept TTL as the fallback.
 
@@ -1062,6 +1167,9 @@ An attacker enumerating IDs, or a client with a stale reference in a retry loop,
 
 Fix: cache the absence, with a short TTL.
 
+<details>
+<summary>Negative caching with a miss sentinel</summary>
+
 ```python
 MISS_SENTINEL = "\x00"
 NEGATIVE_TTL = 30   # much shorter than positive TTL
@@ -1081,6 +1189,8 @@ async def get_with_negative_cache(user_id: int) -> dict | None:
     await redis_client.set(key, json.dumps(row), ex=TTL_SECONDS)
     return row
 ```
+
+</details>
 
 Three details:
 
