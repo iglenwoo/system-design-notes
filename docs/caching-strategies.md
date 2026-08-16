@@ -48,14 +48,7 @@ import redis.asyncio as redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 TTL_SECONDS = 300
 
-# Pure cache: regenerable values only, safe to run with allkeys-lru.
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-
-# Anything that must NOT be evicted — write-behind queues (§5), invalidation
-# version counters and tag sets (§10.3). Separate instance, maxmemory-policy
-# noeviction. See §10.2 for why sharing one instance loses data silently.
-DURABLE_REDIS_URL = os.getenv("DURABLE_REDIS_URL", "redis://localhost:6380/0")
-version_redis = redis.from_url(DURABLE_REDIS_URL, decode_responses=True)
 
 _pool: aiomysql.Pool | None = None
 
@@ -486,16 +479,10 @@ A separate process — not a FastAPI background task. It must survive independen
 import asyncio
 import json
 import logging
-import os
 from app.deps import redis_client, pool, init_pool, close_pool
 
 QUEUE_KEY = "queue:events"
-
-# Per-worker in-flight list. A single shared key is a correctness bug the
-# moment you run two workers — see "Scaling past one worker" below.
-WORKER_ID = os.environ["WORKER_ID"]          # stable across restarts
-INFLIGHT_KEY = f"queue:events:inflight:{WORKER_ID}"
-
+INFLIGHT_KEY = "queue:events:inflight"
 BATCH_SIZE = 500
 FLUSH_INTERVAL = 2.0
 
@@ -503,7 +490,7 @@ log = logging.getLogger("flush")
 
 
 async def claim_batch(limit: int) -> list[dict]:
-    """Move items to our in-flight list so a crash mid-flush loses nothing."""
+    """Move items to an in-flight list so a crash mid-flush loses nothing."""
     items = []
     for _ in range(limit):
         raw = await redis_client.lmove(QUEUE_KEY, INFLIGHT_KEY, "LEFT", "RIGHT")
@@ -527,10 +514,7 @@ async def write_batch(rows: list[dict]) -> None:
 
 
 async def recover_inflight() -> None:
-    """Push anything stranded by our own previous crash back to the queue.
-
-    Touches only this worker's list — never another worker's uncommitted batch.
-    """
+    """On startup, push anything stranded by a previous crash back to the queue."""
     while await redis_client.lmove(INFLIGHT_KEY, QUEUE_KEY, "RIGHT", "LEFT"):
         pass
 
@@ -546,8 +530,6 @@ async def run() -> None:
                 continue
             try:
                 await write_batch(batch)
-                # Safe only because INFLIGHT_KEY is ours alone: it holds
-                # exactly `batch`, oldest-first, and nobody else appends.
                 await redis_client.ltrim(INFLIGHT_KEY, len(batch), -1)
             except Exception:
                 log.exception("flush failed, returning %d rows to queue", len(batch))
@@ -567,22 +549,6 @@ Two details that matter:
 
 - **`LMOVE` to an in-flight list, not `LPOP`.** A plain `LPOP` followed by a crash before `commit()` silently drops the batch. The in-flight list plus `recover_inflight()` gives at-least-once delivery — so make the DB write idempotent (natural key + `INSERT IGNORE` or `ON DUPLICATE KEY UPDATE`) if duplicates would be harmful.
 - **Backpressure.** Monitor `LLEN queue:events`. If producers outrun the worker indefinitely, Redis memory grows until eviction or OOM. Alert on queue depth; shed load or scale workers.
-
-### Scaling past one worker
-
-The in-flight list **must be per-worker**, and getting this wrong reintroduces exactly the data loss it was built to prevent.
-
-With a single shared `queue:events:inflight`, two workers interleave their claims — `claim_batch` issues 500 individual `LMOVE`s, so the list ends up holding A's items and B's items mixed together. Then:
-
-- `ltrim(INFLIGHT_KEY, len(batch), -1)` removes the first N entries, which A assumes are its batch. They aren't — roughly half belong to B and are still uncommitted. **A's commit silently deletes B's unwritten rows.** If B then crashes, they're gone, and `recover_inflight()` has nothing left to recover.
-- `recover_inflight()` on B's error path drains **A's** in-flight items back onto the queue, so A re-delivers rows it already committed.
-
-Both disappear once each worker owns its own list. The remaining caveat is orphaning: if worker 3 is permanently decommissioned, `queue:events:inflight:3` may still hold rows nobody will reclaim. Two ways to handle it:
-
-- **Stable worker identity** — Kubernetes StatefulSet ordinals, or an explicit `WORKER_ID` per process. Worker N always reclaims list N on startup. Simple, and correct as long as N is eventually restarted.
-- **A reaper** — track `SET worker:alive:{id} 1 EX 30` heartbeats and have any worker drain the in-flight list of an ID whose heartbeat has expired. Necessary if worker identities are ephemeral.
-
-At this point you are reimplementing a consumer group. **Redis Streams** (`XADD` / `XREADGROUP` / `XACK`, with `XAUTOCLAIM` for the reaper) provides all of it natively — per-consumer pending entry lists, acknowledgment, and reclaim of stalled entries. Prefer it over lists for anything beyond one worker.
 
 ### The data-loss risk
 
@@ -783,25 +749,11 @@ async def get_single_flight(
             await redis_client.set(key, json.dumps(value), ex=ttl)
         fut.set_result(value)
         return value
-    except BaseException as exc:
-        # BaseException, not Exception. asyncio.CancelledError has inherited
-        # from BaseException since 3.8, and Uvicorn cancels the request task
-        # whenever a client disconnects — so the leader getting cancelled
-        # mid-load is routine, not exotic. `except Exception` would miss it,
-        # leave `fut` unresolved, and park every shielded waiter forever.
-        if not fut.done():
-            fut.set_exception(exc)
+    except Exception as exc:
+        fut.set_exception(exc)
         raise
     finally:
         _inflight.pop(key, None)
-        # Invariant: the future is always resolved before it leaves the dict.
-        if not fut.done():
-            fut.cancel()
-        elif not fut.cancelled():
-            # Reading .exception() marks it retrieved, suppressing asyncio's
-            # "Future exception was never retrieved" warning when the leader
-            # failed with no waiters attached.
-            fut.exception()
 ```
 
 </details>
@@ -827,8 +779,7 @@ Notes:
 
 - Register the future in `_inflight` **before** the first `await` inside the critical section. asyncio gives no preemption between those two statements, which is what makes the check-then-set safe here.
 - `asyncio.shield` prevents a waiter's own cancellation (client disconnect) from cancelling the shared future for everyone else.
-- **The leader's cancellation is the dangerous one.** `shield` guarantees waiters cannot be cancelled along with the leader — which is exactly why an unresolved future strands them permanently rather than failing fast. Hence `except BaseException`, plus the `finally` that resolves the future unconditionally. This is the single easiest way to turn a stampede guard into a hang.
-- Waiters inherit the leader's exception. Usually right — but one DB error then fails N requests at once. Retry at the caller if that's not what you want. A more forgiving variant promotes one waiter to leader and retries instead of propagating; the distributed version in §8.3 does exactly that.
+- Waiters inherit the leader's exception. Usually right — but one DB error then fails N requests at once. Retry at the caller if that's not what you want.
 
 **Limitation:** the dict lives in one process. Eight Uvicorn workers across three pods gives 24 concurrent DB queries instead of 1,000. Better, not solved.
 
@@ -1166,24 +1117,18 @@ Two patterns that work:
 <summary>Version-prefixed keys</summary>
 
 ```python
-# The version counters live on a SEPARATE noeviction instance from the
-# cached values. See the warning below — this is not an optional detail.
 async def user_ns(user_id: int) -> str:
-    v = await version_redis.get(f"ver:user:{user_id}") or "0"
+    v = await redis_client.get(f"ver:user:{user_id}") or "0"
     return f"user:{user_id}:v{v}"
 
 
 async def invalidate_user(user_id: int) -> None:
-    await version_redis.incr(f"ver:user:{user_id}")   # O(1), no scanning
+    await redis_client.incr(f"ver:user:{user_id}")   # O(1), no scanning
 ```
 
 </details>
 
-Cost: orphaned keys linger until TTL, occupying memory. Fine for the *values* on an `allkeys-lru` instance — they're the coldest keys, so they're evicted first.
-
-> ⚠️ **The version counter itself must never be evicted.** It has no TTL, so a `volatile-*` policy already protects it — but on `allkeys-lru` it is evictable like anything else. Evict `ver:user:42` and `user_ns` falls back to `or "0"`, rebuilding the *pre-invalidation* namespace and making stale `user:42:v0` entries reachable again. Silent stale reads, no error anywhere, and the more you invalidate the worse it gets: high version numbers mean the most-invalidated keys are the ones whose counters are coldest and evicted first.
->
-> Counters are tiny and long-lived; values are large and disposable. They want opposite eviction policies, so keep them on different instances (or at minimum `volatile-*` with TTLs only on the values). This is §10.2's rule applied to your own invalidation machinery.
+Cost: orphaned keys linger until TTL, occupying memory. Fine on an `allkeys-lru` instance — they're the coldest keys, so they're evicted first.
 
 **Tag sets** — maintain a Redis set of keys per tag, delete the members.
 
@@ -1191,45 +1136,19 @@ Cost: orphaned keys linger until TTL, occupying memory. Fine for the *values* on
 <summary>Tag sets</summary>
 
 ```python
-TAG_TTL = 86_400   # must exceed the TTL of any key it tracks
-
-
 async def tag(tag_name: str, key: str) -> None:
-    pipe = redis_client.pipeline()
-    pipe.sadd(f"tag:{tag_name}", key)
-    # Bound the set's lifetime — nothing removes a member when the key it
-    # names expires, so without this it accumulates dead names forever.
-    pipe.expire(f"tag:{tag_name}", TAG_TTL)
-    await pipe.execute()
+    await redis_client.sadd(f"tag:{tag_name}", key)
 
 
 async def invalidate_tag(tag_name: str) -> None:
-    # SSCAN, not SMEMBERS: the set may hold far more members than are live,
-    # and SMEMBERS on a large set blocks the single-threaded server.
-    async for chunk in _sscan_chunks(f"tag:{tag_name}", count=500):
-        await redis_client.delete(*chunk)
-    await redis_client.delete(f"tag:{tag_name}")
-
-
-async def _sscan_chunks(set_key: str, count: int):
-    cursor, buf = 0, []
-    while True:
-        cursor, members = await redis_client.sscan(set_key, cursor, count=count)
-        buf.extend(members)
-        if len(buf) >= count or cursor == 0:
-            if buf:
-                yield buf
-                buf = []
-        if cursor == 0:
-            return
+    keys = await redis_client.smembers(f"tag:{tag_name}")
+    if keys:
+        await redis_client.delete(*keys, f"tag:{tag_name}")
 ```
 
 </details>
 
-Two problems, both easy to miss:
-
-- **The tag set can be evicted.** Losing it means losing the ability to invalidate its members — they then survive until their own TTL. Put tag sets on a `noeviction` instance, or accept TTL as the fallback.
-- **The tag set grows without bound.** Nothing removes a member when the key it names expires by TTL, so the set steadily fills with names of keys that no longer exist. Left alone it becomes a large key on the very instance you configured as `noeviction` — and `invalidate_tag` degrades into an `SMEMBERS` of thousands of dead names plus a `DELETE` of keys that aren't there. The `EXPIRE` above caps it; a periodic prune (`SREM` members failing `EXISTS`) is the alternative if the tag must outlive `TAG_TTL`.
+Exact, but the tag set is itself a key that can be evicted — losing it means losing the ability to invalidate its members. Put tag sets on a `noeviction` instance or accept TTL as the fallback.
 
 > **When to worry:** Set `maxmemory` and an explicit `maxmemory-policy` before production, not after the first incident. Default `noeviction` turns a memory spike into write failures; a careless `allkeys-lru` turns it into silent data loss if anything durable shares the instance.
 
