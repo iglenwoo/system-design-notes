@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1310" height="762.5" viewBox="20 -10 1310 762.5"><defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9" fill="none" stroke="context-stroke" stroke-width="1.6"/></marker><marker id="ahs" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M9,1 L0,5 L9,9" fill="none" stroke="context-stroke" stroke-width="1.6"/></marker></defs><rect x="20" y="-10" width="1310" height="762.5" fill="#ffffff"/><text x="60" y="50.28" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="26" fill="#1e40af" text-anchor="start" xml:space="preserve">Cache stampede: count the arrows reaching MySQL</text>
+<text x="60" y="80.48" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="16" fill="#64748b" text-anchor="start" xml:space="preserve">One hot key expires. Every in-flight request misses in the same instant — and each one is holding a DB connection.</text>
+<path d="M695,115 L695,625" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,4"/>
+<text x="60" y="134.82" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="19" fill="#dc2626" text-anchor="start" xml:space="preserve">no coalescing</text>
+<rect x="100" y="158" width="460" height="46" rx="12" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="8,8"/>
+<text x="330.0" y="183.325" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#dc2626" text-anchor="middle" xml:space="preserve">user:42   —   TTL expired at t = 0</text>
+<text x="60" y="232.14" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="13" fill="#64748b" text-anchor="start" xml:space="preserve">1,000 concurrent requests</text>
+<ellipse cx="146.0" cy="256.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="146.0" cy="302.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="146.0" cy="348.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="146.0" cy="394.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="146.0" cy="440.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="146.0" cy="486.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="146.0" cy="532.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<path d="M152,256 L418,390" fill="none" stroke="#dc2626" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M152,302 L418,390" fill="none" stroke="#dc2626" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M152,348 L418,390" fill="none" stroke="#dc2626" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M152,394 L418,390" fill="none" stroke="#dc2626" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M152,440 L418,390" fill="none" stroke="#dc2626" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M152,486 L418,390" fill="none" stroke="#dc2626" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M152,532 L418,390" fill="none" stroke="#dc2626" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<rect x="420" y="350" width="160" height="80" rx="12" fill="#fecaca" stroke="#b91c1c" stroke-width="2"/>
+<text x="500.0" y="392.48" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="16" fill="#374151" text-anchor="middle" xml:space="preserve">MySQL</text>
+<text x="480.0" y="571.7" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#dc2626" text-anchor="middle" xml:space="preserve">1,000 identical SELECTs</text>
+<text x="480.0" y="590.45" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#dc2626" text-anchor="middle" xml:space="preserve">connection pool exhausted</text>
+<text x="480.0" y="609.2" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#dc2626" text-anchor="middle" xml:space="preserve">cascading timeouts</text>
+<text x="730" y="134.82" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="19" fill="#047857" text-anchor="start" xml:space="preserve">with single-flight</text>
+<rect x="770" y="158" width="460" height="46" rx="12" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="8,8"/>
+<text x="1000.0" y="183.325" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#dc2626" text-anchor="middle" xml:space="preserve">user:42   —   TTL expired at t = 0</text>
+<text x="730" y="232.14" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="13" fill="#64748b" text-anchor="start" xml:space="preserve">same 1,000 requests</text>
+<ellipse cx="806.0" cy="256.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="806.0" cy="302.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="806.0" cy="348.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="806.0" cy="394.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="806.0" cy="440.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="806.0" cy="486.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<ellipse cx="806.0" cy="532.0" rx="6.0" ry="6.0" fill="#3b82f6" stroke="#3b82f6" stroke-width="1"/>
+<path d="M812,256 L898,390" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M812,302 L898,390" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M812,348 L898,390" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M812,394 L898,390" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M812,440 L898,390" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M812,486 L898,390" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<path d="M812,532 L898,390" fill="none" stroke="#94a3b8" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<rect x="900" y="350" width="140" height="80" rx="12" fill="#3b82f6" stroke="#1e3a5f" stroke-width="2"/>
+<text x="970.0" y="383.42" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="14" fill="#ffffff" text-anchor="middle" xml:space="preserve">one promise</text>
+<text x="970.0" y="400.92" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="14" fill="#ffffff" text-anchor="middle" xml:space="preserve">per key</text>
+<path d="M1040,390 L1130,390" fill="none" stroke="#047857" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#ah)"/>
+<text x="1085.0" y="362.14" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="13" fill="#047857" text-anchor="middle" xml:space="preserve">exactly one</text>
+<rect x="1130" y="350" width="160" height="80" rx="12" fill="#a7f3d0" stroke="#047857" stroke-width="2"/>
+<text x="1210.0" y="392.48" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="16" fill="#374151" text-anchor="middle" xml:space="preserve">MySQL</text>
+<text x="1140.0" y="571.7" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#047857" text-anchor="middle" xml:space="preserve">1 SELECT</text>
+<text x="1140.0" y="590.45" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#047857" text-anchor="middle" xml:space="preserve">999 requests wait and share</text>
+<text x="1140.0" y="609.2" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="15" fill="#047857" text-anchor="middle" xml:space="preserve">the leader&#x27;s result</text>
+<text x="60" y="670.92" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="14" fill="#64748b" text-anchor="start" xml:space="preserve">The gate is per-process, so N app processes still send N queries — better, not solved. A Redis SET NX EX lock collapses it across the fleet.</text>
+<text x="60" y="688.42" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="14" fill="#64748b" text-anchor="start" xml:space="preserve">But reach for TTL jitter first: keys warmed together expire together, and smearing their expiry costs one line and prevents the herd from</text>
+<text x="60" y="705.92" font-family="-apple-system, BlinkMacSystemFont, &apos;Helvetica Neue&apos;, Helvetica, Arial, sans-serif" font-size="14" fill="#64748b" text-anchor="start" xml:space="preserve">forming at all. Single-flight is for the keys hot enough to stampede on their own.</text></svg>

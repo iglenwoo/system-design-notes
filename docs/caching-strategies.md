@@ -2,7 +2,7 @@
 
 Beyond cache-aside: the read/write strategy matrix, and the failure modes that bite you regardless of which cell you pick.
 
-All code examples use **FastAPI + MySQL (aiomysql) + Redis (redis-py asyncio)**.
+Examples are **pseudo-code shaped like FastAPI + MySQL + Redis** — real route decorators, real Redis commands, real SQL, with the plumbing stripped out so the caching decision stays visible.
 
 ---
 
@@ -32,80 +32,23 @@ All code examples use **FastAPI + MySQL (aiomysql) + Redis (redis-py asyncio)**.
 
 ---
 
-## Shared Setup
+## Reading the Pseudo-Code
 
-Every example below assumes this wiring.
+Every example is **pseudo-code**, not runnable Python. It keeps the shape of FastAPI + MySQL + Redis — real route decorators, real Redis commands, real SQL — and drops connection pools, imports, serialization, and error plumbing so the caching decision stays visible.
 
-<details>
-<summary><code>app/deps.py</code> — Redis client and MySQL pool</summary>
+| Pseudo-call | Real thing underneath |
+|---|---|
+| `cache.get(k)` / `cache.set(k, v, ttl=n)` | Redis `GET` / `SET k v EX n` |
+| `cache.delete(k)` / `cache.exists(k)` | Redis `DEL` / `EXISTS` |
+| `cache.set(k, v, nx=True, ex=n)` | Redis `SET k v NX EX n` — atomic lock acquire |
+| `cache.rpush` / `lmove` / `ltrim` | Redis list ops, verbatim |
+| `db.query(sql, args)` | MySQL `SELECT` — returns a row, or `None` |
+| `db.execute(sql, args)` + `db.commit()` | MySQL `INSERT`/`UPDATE`, explicit commit |
+| `db.execute_many(sql, rows)` | One multi-row `INSERT` |
 
-```python
-# app/deps.py
-import os
-import aiomysql
-import redis.asyncio as redis
+Values are shown going into the cache as objects; assume JSON in and out. A runnable demo per strategy lives in `demos/` (coming).
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-TTL_SECONDS = 300
-
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-
-_pool: aiomysql.Pool | None = None
-
-
-async def init_pool() -> None:
-    global _pool
-    _pool = await aiomysql.create_pool(
-        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-        port=int(os.getenv("MYSQL_PORT", "3306")),
-        user=os.getenv("MYSQL_USER", "root"),
-        password=os.getenv("MYSQL_PASSWORD", ""),
-        db=os.getenv("MYSQL_DB", "app"),
-        autocommit=False,
-        minsize=1,
-        maxsize=10,
-    )
-
-
-async def close_pool() -> None:
-    if _pool is not None:
-        _pool.close()
-        await _pool.wait_closed()
-
-
-def pool() -> aiomysql.Pool:
-    assert _pool is not None, "init_pool() not called"
-    return _pool
-```
-
-</details>
-
-<details>
-<summary><code>app/main.py</code> — lifespan wiring</summary>
-
-```python
-# app/main.py
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from app.deps import init_pool, close_pool
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_pool()
-    yield
-    await close_pool()
-
-
-app = FastAPI(lifespan=lifespan)
-```
-
-</details>
-
-Table used throughout:
-
-<details>
-<summary><code>users</code> table schema</summary>
+The table used throughout:
 
 ```sql
 CREATE TABLE users (
@@ -115,8 +58,6 @@ CREATE TABLE users (
   updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 ```
-
-</details>
 
 ---
 
@@ -145,18 +86,7 @@ So "cache-aside" in casual usage usually means **cache-aside reads + write-aroun
 
 The two axes are orthogonal to a third thing entirely: **what happens when the cache doesn't have the answer and a thousand requests notice at once.** That's Part II. It is not a strategy — it's a failure mode every strategy in Part I shares.
 
-```
-                    WRITE AXIS
-              through   behind   around
-            ┌─────────┬────────┬─────────┐
-     aside  │ settings│metrics │ default │
-R           │ billing │counters│ (most   │
-E           │         │        │  apps)  │
-A           ├─────────┼────────┼─────────┤
-D  through  │  CDN +  │ rare   │ CDN     │
-            │ origin  │        │ typical │
-            └─────────┴────────┴─────────┘
-```
+![The two axes: one read choice times one write choice](diagrams/two-axes.png)
 
 ---
 
@@ -171,45 +101,22 @@ READ:  app → cache (miss) → DB → app writes cache → return
 ```
 
 <details>
-<summary><code>app/cache_aside.py</code> — read path</summary>
+<summary>Cache-aside read path — the app orchestrates</summary>
 
 ```python
-# app/cache_aside.py
-import json
-import aiomysql
-from fastapi import APIRouter, HTTPException
-from app.deps import redis_client, pool, TTL_SECONDS
+@app.get("/users/{user_id}")
+def get_user(user_id):
+    key = f"user:{user_id}"
 
-router = APIRouter()
+    hit = cache.get(key)                     # GET user:42
+    if hit:
+        return hit                           # HIT -- the DB is never touched
 
+    row = db.query("SELECT * FROM users WHERE id = %s", user_id)
+    if not row:
+        return 404
 
-def user_key(user_id: int) -> str:
-    return f"user:{user_id}"
-
-
-async def load_user_from_db(user_id: int) -> dict | None:
-    async with pool().acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                "SELECT id, email, display_name FROM users WHERE id = %s",
-                (user_id,),
-            )
-            return await cur.fetchone()
-
-
-@router.get("/users/{user_id}")
-async def get_user(user_id: int) -> dict:
-    key = user_key(user_id)
-
-    cached = await redis_client.get(key)
-    if cached is not None:
-        return json.loads(cached)
-
-    row = await load_user_from_db(user_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="user not found")
-
-    await redis_client.set(key, json.dumps(row), ex=TTL_SECONDS)
+    cache.set(key, row, ttl=300)             # the app backfills the cache
     return row
 ```
 
@@ -229,57 +136,43 @@ The write half of what people call "cache-aside" is [write-around](#6-write-arou
 
 The application asks the **cache** for a key and stops there. On a miss, the *cache* loads from the database, populates itself, and returns the value. The app has no DB code in its read path at all.
 
-```
-Cache-aside:   app → cache (miss) → app → DB → app → cache
-Read-through:  app → cache (miss → cache loads from DB itself) → app
-```
+![Cache-aside vs read-through: who owns the loader](diagrams/read-strategies.png)
 
 Observable behavior is nearly identical to cache-aside. The difference is **where the loading logic lives**. Read-through centralizes it, so every caller inherits the same TTL, serialization, negative caching, and stampede protection without having to remember any of it.
 
 Redis cannot do this natively — it has no MySQL connector. App-level "read-through" with Redis means a wrapper that owns the loader function:
 
 <details>
-<summary><code>app/read_through.py</code> — the cache owns the loader</summary>
+<summary>Read-through wrapper — the cache owns the loader</summary>
 
 ```python
-# app/read_through.py
-from typing import Awaitable, Callable
-import json
-from app.deps import redis_client, TTL_SECONDS
-
-MISS_SENTINEL = "\x00"
-
+MISS = "<known-absent>"
 
 class ReadThroughCache:
     """The cache owns the loader. Callers never see the DB."""
 
-    def __init__(
-        self,
-        loader: Callable[[str], Awaitable[dict | None]],
-        ttl: int = TTL_SECONDS,
-        negative_ttl: int = 30,
-    ):
-        self._loader = loader
-        self._ttl = ttl
-        self._negative_ttl = negative_ttl
+    def __init__(self, loader, ttl=300, negative_ttl=30):
+        self.loader, self.ttl, self.negative_ttl = loader, ttl, negative_ttl
 
-    async def get(self, key: str) -> dict | None:
-        cached = await redis_client.get(key)
-        if cached is not None:
-            return None if cached == MISS_SENTINEL else json.loads(cached)
+    def get(self, key):
+        hit = cache.get(key)
+        if hit is not None:
+            return None if hit == MISS else hit
 
-        value = await self._loader(key)
+        value = self.loader(key)
+
         if value is None:
-            # Negative caching — see §11.
-            await redis_client.set(key, MISS_SENTINEL, ex=self._negative_ttl)
+            cache.set(key, MISS, ttl=self.negative_ttl)   # negative cache, see §11
             return None
 
-        await redis_client.set(key, json.dumps(value), ex=self._ttl)
+        cache.set(key, value, ttl=self.ttl)
         return value
 
 
+# Loading policy -- TTL, negative caching, serialization -- defined once, here.
 user_cache = ReadThroughCache(
-    loader=lambda k: load_user_from_db(int(k.split(":")[1]))
+    loader=lambda key: db.query("SELECT * FROM users WHERE id = %s",
+                                key.split(":")[1])
 )
 ```
 
@@ -289,12 +182,11 @@ user_cache = ReadThroughCache(
 <summary>Route using the read-through cache</summary>
 
 ```python
-@router.get("/users/{user_id}")
-async def get_user(user_id: int) -> dict:
-    user = await user_cache.get(f"user:{user_id}")
-    if user is None:
-        raise HTTPException(status_code=404, detail="user not found")
-    return user
+@app.get("/users/{user_id}")
+def get_user(user_id):
+    return user_cache.get(f"user:{user_id}") or 404
+    # note what is absent: no SQL, no TTL, no cache.set. The route
+    # cannot get the caching policy wrong, because it has none.
 ```
 
 </details>
@@ -322,10 +214,9 @@ Read-through is the *native* model for infrastructure that sits in front of an o
 
 Conceptually, the application writes **only to the cache**, and the cache synchronously persists to the database before acknowledging. Reads therefore always hit a cache that reflects committed state.
 
-```
-WRITE:  app → cache → (synchronous) DB → ack
-READ:   app → cache (always warm for written keys)
-```
+All three write strategies share one timeline. §4, §5, and §6 are the three lanes; the orange tick is the ack:
+
+![Write strategies relative to the ack](diagrams/write-timing.png)
 
 Redis has no native write-through to MySQL, so in practice you implement it in the application's write path: one function that owns "DB commit, then cache update" as a single unit. The important property is not *where the code lives* — it's that no write path exists that touches the DB without also refreshing the cache.
 
@@ -334,55 +225,30 @@ Redis has no native write-through to MySQL, so in practice you implement it in t
 Write DB first. The inverse means a DB failure leaves the cache advertising a value that was never persisted — a lie that survives until TTL.
 
 <details>
-<summary><code>app/write_through.py</code> — DB commit, then cache set</summary>
+<summary>Write-through — DB commit, then cache set</summary>
 
 ```python
-# app/write_through.py
-import json
-import aiomysql
-from fastapi import APIRouter
-from pydantic import BaseModel
-from app.deps import redis_client, pool, TTL_SECONDS
+@app.put("/users/{user_id}/settings")
+def update_settings(user_id, body):
 
-router = APIRouter()
+    # 1. Durable write FIRST. If this raises, nothing was cached --
+    #    the cache can never advertise a value the DB rejected.
+    db.execute("""
+        INSERT INTO users (id, email, display_name) VALUES (%s, %s, %s)
+        ON DUPLICATE KEY UPDATE email        = VALUES(email),
+                                display_name = VALUES(display_name)
+    """, user_id, body.email, body.display_name)
+    db.commit()
 
-
-class SettingsUpdate(BaseModel):
-    email: str
-    display_name: str
-
-
-@router.put("/users/{user_id}/settings")
-async def write_through_update(user_id: int, body: SettingsUpdate) -> dict:
-    record = {"id": user_id, "email": body.email, "display_name": body.display_name}
-
-    # 1. Synchronous durable write. If this raises, nothing is cached.
-    async with pool().acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO users (id, email, display_name)
-                VALUES (%s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    email = VALUES(email),
-                    display_name = VALUES(display_name)
-                """,
-                (user_id, body.email, body.display_name),
-            )
-        await conn.commit()
-
-    # 2. Cache refresh, same request. Failure here must not 500 the write —
-    #    the durable copy already landed. Degrade to invalidation.
-    key = f"user:{user_id}"
+    # 2. Cache refresh, same request, so the next read is warm.
     try:
-        await redis_client.set(key, json.dumps(record), ex=TTL_SECONDS)
-    except Exception:
-        try:
-            await redis_client.delete(key)
-        except Exception:
-            pass  # next read falls through to DB; TTL bounds the damage
+        cache.set(f"user:{user_id}", body, ttl=300)
+    except CacheUnavailable:
+        # The row is already durable. Failing the request now would be a lie.
+        # Degrade to invalidation: the next read falls through to the DB.
+        cache.delete(f"user:{user_id}")
 
-    return record
+    return body
 ```
 
 </details>
@@ -424,42 +290,18 @@ Write latency becomes one Redis round-trip. Throughput improves further because 
 ### Producer: the FastAPI endpoint
 
 <details>
-<summary><code>app/write_behind.py</code> — producer endpoint</summary>
+<summary>Write-behind producer — the endpoint</summary>
 
 ```python
-# app/write_behind.py
-import json
-import time
-from fastapi import APIRouter
-from pydantic import BaseModel
-from app.deps import redis_client
+@app.post("/events", status_code=202)     # 202 Accepted: buffered, NOT durable
+def record_event(event):
+    pipe = cache.pipeline()
+    pipe.rpush("queue:events", event)                        # the write buffer
+    pipe.hincrby(f"stats:{event.user_id}", event.name, 1)    # the readable value
+    pipe.execute()
 
-router = APIRouter()
-
-QUEUE_KEY = "queue:events"
-
-
-class Event(BaseModel):
-    user_id: int
-    name: str
-    value: float
-
-
-@router.post("/events", status_code=202)
-async def record_event(event: Event) -> dict:
-    payload = json.dumps({
-        "user_id": event.user_id,
-        "name": event.name,
-        "value": event.value,
-        "ts": time.time(),
-    })
-
-    pipe = redis_client.pipeline()
-    pipe.rpush(QUEUE_KEY, payload)
-    # Serve reads from the cache immediately, before the DB knows anything.
-    pipe.hincrby(f"stats:{event.user_id}", event.name, 1)
-    await pipe.execute()
-
+    # Both in one round trip. Reads see the new count immediately --
+    # the DB still knows nothing about it.
     return {"status": "accepted"}
 ```
 
@@ -472,75 +314,52 @@ async def record_event(event: Event) -> dict:
 A separate process — not a FastAPI background task. It must survive independently of the web process.
 
 <details>
-<summary><code>worker/flush.py</code> — batched flush worker</summary>
+<summary>Write-behind consumer — the flush worker</summary>
 
 ```python
-# worker/flush.py
-import asyncio
-import json
-import logging
-from app.deps import redis_client, pool, init_pool, close_pool
+# A SEPARATE PROCESS. Must outlive any individual web worker.
 
-QUEUE_KEY = "queue:events"
-INFLIGHT_KEY = "queue:events:inflight"
-BATCH_SIZE = 500
-FLUSH_INTERVAL = 2.0
-
-log = logging.getLogger("flush")
+QUEUE    = "queue:events"
+INFLIGHT = "queue:events:inflight"
 
 
-async def claim_batch(limit: int) -> list[dict]:
-    """Move items to an in-flight list so a crash mid-flush loses nothing."""
-    items = []
-    for _ in range(limit):
-        raw = await redis_client.lmove(QUEUE_KEY, INFLIGHT_KEY, "LEFT", "RIGHT")
-        if raw is None:
+def claim_batch(limit):
+    """LMOVE, not LPOP: a crash before commit must not lose the batch."""
+    batch = []
+    while len(batch) < limit:
+        row = cache.lmove(QUEUE, INFLIGHT, "LEFT", "RIGHT")
+        if not row:
             break
-        items.append(json.loads(raw))
-    return items
+        batch.append(row)
+    return batch
 
 
-async def write_batch(rows: list[dict]) -> None:
-    async with pool().acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.executemany(
-                """
-                INSERT INTO events (user_id, name, value, created_at)
-                VALUES (%s, %s, %s, FROM_UNIXTIME(%s))
-                """,
-                [(r["user_id"], r["name"], r["value"], r["ts"]) for r in rows],
-            )
-        await conn.commit()
-
-
-async def recover_inflight() -> None:
-    """On startup, push anything stranded by a previous crash back to the queue."""
-    while await redis_client.lmove(INFLIGHT_KEY, QUEUE_KEY, "RIGHT", "LEFT"):
+def recover_inflight():
+    """On startup, return whatever a previous crash stranded mid-flush."""
+    while cache.lmove(INFLIGHT, QUEUE, "RIGHT", "LEFT"):
         pass
 
 
-async def run() -> None:
-    await init_pool()
-    await recover_inflight()
-    try:
-        while True:
-            batch = await claim_batch(BATCH_SIZE)
-            if not batch:
-                await asyncio.sleep(FLUSH_INTERVAL)
-                continue
-            try:
-                await write_batch(batch)
-                await redis_client.ltrim(INFLIGHT_KEY, len(batch), -1)
-            except Exception:
-                log.exception("flush failed, returning %d rows to queue", len(batch))
-                await recover_inflight()
-                await asyncio.sleep(FLUSH_INTERVAL)
-    finally:
-        await close_pool()
+def run():
+    recover_inflight()
 
+    while True:
+        batch = claim_batch(500)
+        if not batch:
+            sleep(2)
+            continue
 
-if __name__ == "__main__":
-    asyncio.run(run())
+        try:
+            db.execute_many("""
+                INSERT INTO events (user_id, name, value, created_at)
+                VALUES (%s, %s, %s, %s)
+            """, batch)                       # 500 inserts -> one round trip
+            db.commit()
+            cache.ltrim(INFLIGHT, len(batch), -1)     # ack: drop what we wrote
+
+        except DBError:
+            recover_inflight()                # put them back, retry next tick
+            sleep(2)
 ```
 
 </details>
@@ -575,25 +394,17 @@ If losing a window of writes is unacceptable, this is the wrong strategy — use
 
 Write straight to the database, then **delete** the cache key. The next read repopulates it through whichever read strategy you're using.
 
-```
-WRITE:  app → DB → app DELETEs cache key
-```
-
 <details>
 <summary>Write-around update — commit, then <code>DELETE</code> the key</summary>
 
 ```python
-@router.put("/users/{user_id}")
-async def update_user(user_id: int, display_name: str) -> dict:
-    async with pool().acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE users SET display_name = %s WHERE id = %s",
-                (display_name, user_id),
-            )
-        await conn.commit()
+@app.put("/users/{user_id}")
+def update_user(user_id, display_name):
+    db.execute("UPDATE users SET display_name = %s WHERE id = %s",
+               display_name, user_id)
+    db.commit()
 
-    await redis_client.delete(user_key(user_id))
+    cache.delete(f"user:{user_id}")    # DELETE, never SET -- see the race below
     return {"id": user_id, "display_name": display_name}
 ```
 
@@ -603,12 +414,7 @@ async def update_user(user_id: int, display_name: str) -> dict:
 
 Deleting is strictly safer than writing the new value, for a reason that isn't obvious:
 
-```
-writer A: UPDATE name='old→A'  ─────────────┐
-writer B: UPDATE name='A→B'    ──┐          │
-                                 ▼          ▼
-                            SET cache=B   SET cache=A   ← A wins, cache now stale forever
-```
+![Why write-around deletes instead of updating](diagrams/write-around-race.png)
 
 Two writers can commit in one order and update the cache in the opposite order, leaving the cache permanently wrong until TTL. A `DELETE` has no such hazard — whoever deletes last still leaves the key absent, and the next read pulls committed state.
 
@@ -679,12 +485,7 @@ Nothing in this part is a caching strategy. These are the things that break *aft
 
 A hot key expires. In the microseconds before anything repopulates it, every in-flight request misses simultaneously — and every one queries the database.
 
-```
-t=0.000  key "user:42" TTL expires
-t=0.001  1,000 concurrent requests → all MISS
-t=0.002  1,000 identical SELECTs hit MySQL
-t=0.050  MySQL connection pool exhausted → cascading timeouts
-```
+![Cache stampede: count the arrows reaching MySQL](diagrams/cache-stampede.png)
 
 Also called *dog-piling*. Worst exactly where you'd least like it: your most popular keys, under your heaviest traffic. And self-amplifying — the DB slows down, so requests take longer, so more pile up behind the same miss.
 
@@ -698,9 +499,9 @@ The cheapest fix by a wide margin, and it addresses the most common trigger: key
 <summary>TTL jitter — two lines</summary>
 
 ```python
-import random
-
-await redis_client.set(key, json.dumps(row), ex=TTL_SECONDS + random.randint(0, 60))
+cache.set(key, row, ttl=300 + random_between(0, 60))
+# Keys warmed together (deploy, batch job, traffic spike) otherwise expire
+# together. Jitter smears them so the herd never forms.
 ```
 
 </details>
@@ -709,51 +510,41 @@ A cache warmed by a deploy, a batch job, or a traffic spike has thousands of key
 
 Jitter does not help a *single* key that's hot enough to stampede on its own — that's what the rest of §8 is for.
 
-### 8.2 Single-flight, in-process (`asyncio.Future`)
+### 8.2 Single-flight, in-process (a promise per key)
 
 Exactly one request executes the expensive load; every other request for that key waits and shares the result. Within one Python process, a dict of in-flight futures is enough.
 
 <details>
-<summary><code>app/singleflight.py</code> — in-process coalescing</summary>
+<summary>In-process coalescing — one promise per key</summary>
 
 ```python
-# app/singleflight.py
-import asyncio
-import json
-from typing import Awaitable, Callable
-from app.deps import redis_client, TTL_SECONDS
+inflight = {}      # cache key -> pending result. THIS PROCESS ONLY.
 
-_inflight: dict[str, asyncio.Future] = {}
+def get_single_flight(key, loader, ttl=300):
+    hit = cache.get(key)
+    if hit:
+        return hit
 
+    if key in inflight:
+        return wait_for(inflight[key])   # someone is already loading it
 
-async def get_single_flight(
-    key: str,
-    loader: Callable[[], Awaitable[dict | None]],
-    ttl: int = TTL_SECONDS,
-) -> dict | None:
-    cached = await redis_client.get(key)
-    if cached is not None:
-        return json.loads(cached)
-
-    # Someone is already loading this key — await their result.
-    existing = _inflight.get(key)
-    if existing is not None:
-        return await asyncio.shield(existing)
-
-    fut: asyncio.Future = asyncio.get_running_loop().create_future()
-    _inflight[key] = fut
+    promise = new_promise()
+    inflight[key] = promise
+    # Registered before anything can yield -- that is what makes
+    # this check-then-set safe without a lock.
 
     try:
-        value = await loader()
-        if value is not None:
-            await redis_client.set(key, json.dumps(value), ex=ttl)
-        fut.set_result(value)
+        value = loader()                 # exactly one caller reaches here
+        cache.set(key, value, ttl=ttl)
+        promise.resolve(value)
         return value
-    except Exception as exc:
-        fut.set_exception(exc)
-        raise
+
+    except ANYTHING as err:              # including cancellation / disconnect
+        promise.reject(err)              # never leave waiters unresolved --
+        raise                            # a leaked promise hangs them forever
+
     finally:
-        _inflight.pop(key, None)
+        del inflight[key]
 ```
 
 </details>
@@ -762,15 +553,12 @@ async def get_single_flight(
 <summary>Route using single-flight</summary>
 
 ```python
-@router.get("/users/{user_id}")
-async def get_user(user_id: int) -> dict:
-    user = await get_single_flight(
+@app.get("/users/{user_id}")
+def get_user(user_id):
+    return get_single_flight(
         f"user:{user_id}",
-        lambda: load_user_from_db(user_id),
-    )
-    if user is None:
-        raise HTTPException(status_code=404, detail="user not found")
-    return user
+        loader=lambda: db.query("SELECT * FROM users WHERE id = %s", user_id),
+    ) or 404
 ```
 
 </details>
@@ -778,7 +566,8 @@ async def get_user(user_id: int) -> dict:
 Notes:
 
 - Register the future in `_inflight` **before** the first `await` inside the critical section. asyncio gives no preemption between those two statements, which is what makes the check-then-set safe here.
-- `asyncio.shield` prevents a waiter's own cancellation (client disconnect) from cancelling the shared future for everyone else.
+- **Waiters must not be able to cancel the leader.** One client disconnecting cannot be allowed to abort the load that everyone else is waiting on. (In Python: `asyncio.shield`.)
+- **The leader must always resolve the promise — including when it is cancelled.** Because waiters cannot be cancelled with the leader, a promise that is dropped without being resolved leaves them parked forever. Fast failure is fine; silence is not. This is the easiest way to turn a stampede guard into a hang.
 - Waiters inherit the leader's exception. Usually right — but one DB error then fails N requests at once. Retry at the caller if that's not what you want.
 
 **Limitation:** the dict lives in one process. Eight Uvicorn workers across three pods gives 24 concurrent DB queries instead of 1,000. Better, not solved.
@@ -788,79 +577,64 @@ Notes:
 To coalesce across processes and hosts, the lock has to live where everyone can see it.
 
 <details>
-<summary><code>app/distributed_singleflight.py</code> — Redis-lock coalescing</summary>
+<summary>Distributed coalescing — <code>SET NX EX</code> as the lock</summary>
 
 ```python
-# app/distributed_singleflight.py
-import asyncio
-import json
-import uuid
-from typing import Awaitable, Callable
-from app.deps import redis_client, TTL_SECONDS
-
-LOCK_TTL = 10          # seconds; must exceed worst-case loader runtime
-POLL_INTERVAL = 0.05   # 50 ms
-POLL_TIMEOUT = 5.0     # give up waiting and load it ourselves
-
-# Only release a lock we still own — otherwise a slow holder whose lock
-# already expired would delete the *next* holder's lock.
-_RELEASE = """
-if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-else
-    return 0
-end
-"""
+LOCK_TTL      = 10     # must exceed p99 loader time (see failure table below)
+POLL_INTERVAL = 0.05
+POLL_TIMEOUT  = 5
 
 
-async def get_coalesced(
-    key: str,
-    loader: Callable[[], Awaitable[dict | None]],
-    ttl: int = TTL_SECONDS,
-) -> dict | None:
-    cached = await redis_client.get(key)
-    if cached is not None:
-        return json.loads(cached)
+def get_coalesced(key, loader, ttl=300):
+    hit = cache.get(key)
+    if hit:
+        return hit
 
-    lock_key = f"lock:{key}"
-    token = uuid.uuid4().hex
-    release = redis_client.register_script(_RELEASE)
+    lock, token = f"lock:{key}", random_token()
 
-    # SET NX EX: atomic "acquire if absent, auto-expire".
-    # The EX is the deadlock guard — if we crash holding it, it frees itself.
-    if await redis_client.set(lock_key, token, nx=True, ex=LOCK_TTL):
+    # SET NX EX == atomic "acquire if absent, and auto-expire".
+    # The EX is the deadlock guard: crash while holding it and it frees itself.
+    if cache.set(lock, token, nx=True, ex=LOCK_TTL):
         try:
-            value = await loader()
-            if value is not None:
-                await redis_client.set(key, json.dumps(value), ex=ttl)
+            value = loader()                       # THE one DB query
+            cache.set(key, value, ttl=ttl)
             return value
         finally:
-            await release(keys=[lock_key], args=[token])
+            release_if_still_ours(lock, token)
 
-    # We lost the race. Poll for the leader's result.
-    deadline = asyncio.get_running_loop().time() + POLL_TIMEOUT
-    while asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(POLL_INTERVAL)
+    # ---- We lost the race. Poll for the leader's result. ----
+    deadline = now() + POLL_TIMEOUT
+    while now() < deadline:
+        sleep(POLL_INTERVAL)
 
-        cached = await redis_client.get(key)
-        if cached is not None:
-            return json.loads(cached)
+        hit = cache.get(key)
+        if hit:
+            return hit                             # leader delivered
 
-        # Lock gone but no value: leader crashed, or the loader returned None.
-        # Try to become the new leader.
-        if not await redis_client.exists(lock_key):
-            if await redis_client.set(lock_key, token, nx=True, ex=LOCK_TTL):
+        if not cache.exists(lock):
+            # Lock gone but still no value => the leader died mid-load.
+            # Try to become the new leader.
+            if cache.set(lock, token, nx=True, ex=LOCK_TTL):
                 try:
-                    value = await loader()
-                    if value is not None:
-                        await redis_client.set(key, json.dumps(value), ex=ttl)
+                    value = loader()
+                    cache.set(key, value, ttl=ttl)
                     return value
                 finally:
-                    await release(keys=[lock_key], args=[token])
+                    release_if_still_ours(lock, token)
 
-    # Timed out waiting. Fall back to loading directly rather than erroring —
+    # Budget spent. Load it ourselves rather than erroring:
     # a slow response beats a 500, and this path is rare by construction.
-    return await loader()
+    return loader()
+
+
+# Compare-and-delete, atomically, in Lua. A plain DEL is wrong: a slow leader
+# whose lock already expired would delete the NEXT holder's lock.
+release_if_still_ours = LUA("""
+    if redis.call("get", KEYS[1]) == ARGV[1]
+        then return redis.call("del", KEYS[1])
+        else return 0
+    end
+""")
 ```
 
 </details>
@@ -883,13 +657,10 @@ Every failure mode this handles, and why each line exists:
 - **`redis-py`'s built-in `lock()`** — blocking acquire with timeout, ownership tokens, `extend()` for watchdog renewal, context-manager release. Same primitive, sharp edges already sanded down:
 
   ```python
-  lock = redis_client.lock(f"lock:{key}", timeout=10, blocking_timeout=5)
-  if await lock.acquire():
-      try:
-          value = await loader()
-          await redis_client.set(key, json.dumps(value), ex=TTL_SECONDS)
-      finally:
-          await lock.release()
+  # Same primitive as above, with the sharp edges already handled.
+  with cache.lock(f"lock:{key}", timeout=10, blocking_timeout=5):
+      value = loader()
+      cache.set(key, value, ttl=300)
   ```
 
 - **`aiocache`** — `@cached` decorators with pluggable Redis backends and lock plugins (`RedLock`, `OptimisticLock`) wrapping exactly this pattern.
@@ -906,36 +677,24 @@ Both avoid the cold window entirely rather than serializing access to it.
 <summary>XFetch — probabilistic early expiration</summary>
 
 ```python
-import math
-import random
-import time
+BETA = 1.0     # > 1 refreshes more eagerly
 
-BETA = 1.0  # >1 refreshes more eagerly
+def get_xfetch(key, loader, ttl=300):
+    value, cost, remaining = cache.mget(key, f"{key}:cost", ttl_of(key))
 
+    # Recompute EARLY, with probability rising as expiry approaches and
+    # scaled by how expensive the last load was.
+    if value and remaining > 0:
+        if cost * BETA * -log(random()) < remaining:
+            return value                    # still comfortably fresh
 
-async def get_xfetch(key: str, loader, ttl: int = TTL_SECONDS) -> dict | None:
-    pipe = redis_client.pipeline()
-    pipe.get(key)
-    pipe.get(f"{key}:delta")   # how long the last load took
-    pipe.ttl(key)
-    cached, delta_raw, remaining = await pipe.execute()
-
-    if cached is not None:
-        delta = float(delta_raw or 0.01)
-        # Recompute early with probability that grows as `remaining` shrinks.
-        if remaining > 0 and delta * BETA * -math.log(random.random()) < remaining:
-            return json.loads(cached)
-
-    start = time.perf_counter()
-    value = await loader()
-    elapsed = time.perf_counter() - start
-
-    if value is not None:
-        pipe = redis_client.pipeline()
-        pipe.set(key, json.dumps(value), ex=ttl)
-        pipe.set(f"{key}:delta", elapsed, ex=ttl)
-        await pipe.execute()
+    started = now()
+    value   = loader()
+    cache.set(key, value, ttl=ttl)
+    cache.set(f"{key}:cost", now() - started, ttl=ttl)   # remember the cost
     return value
+
+# Expensive keys get refreshed earlier than cheap ones, automatically.
 ```
 
 </details>
@@ -948,29 +707,28 @@ Expensive keys (large `delta`) get refreshed earlier than cheap ones, automatica
 <summary>Stale-while-revalidate</summary>
 
 ```python
-async def _refresh(key: str, loader, fresh_for: int, serve_stale_for: int):
-    value = await loader()
-    if value is not None:
-        entry = {"value": value, "expires_at": time.time() + fresh_for}
-        # Redis TTL is the *stale* budget, longer than logical freshness.
-        await redis_client.set(key, json.dumps(entry), ex=serve_stale_for)
-    return value
+def refresh(key, loader, fresh_for, stale_for):
+    value = loader()
+    cache.set(key, {"value": value, "fresh_until": now() + fresh_for},
+              ttl=stale_for)          # Redis TTL is the STALE budget --
+    return value                      # deliberately longer than freshness
 
 
-async def get_swr(key: str, loader, fresh_for: int = 300, serve_stale_for: int = 3600):
-    raw = await redis_client.get(key)
-    if raw is not None:
-        entry = json.loads(raw)
-        if entry["expires_at"] > time.time():
-            return entry["value"]                     # fresh
-        asyncio.create_task(_refresh(key, loader, fresh_for, serve_stale_for))
-        return entry["value"]                         # stale, but instant
-    return await _refresh(key, loader, fresh_for, serve_stale_for)
+def get_swr(key, loader, fresh_for=300, stale_for=3600):
+    entry = cache.get(key)
+    if not entry:
+        return refresh(key, loader, fresh_for, stale_for)   # cold: must wait
+
+    if entry.fresh_until > now():
+        return entry.value                                  # fresh: return it
+
+    spawn(refresh, key, loader, fresh_for, stale_for)       # stale: refresh
+    return entry.value                                      # ...but answer NOW
 ```
 
 </details>
 
-Zero-latency reads, bounded staleness. Two things to get right: hold a reference to the `create_task` handle (a bare task can be garbage-collected mid-flight), and route `_refresh` through single-flight (§8.2) so the background refreshes don't stampede either — otherwise every stale read spawns its own loader.
+Zero-latency reads, bounded staleness. One thing to get right: route `refresh` through single-flight (§8.2), or every stale read spawns its own loader and you have rebuilt the stampede you were avoiding.
 
 > **When to use each:** Jitter always. Single-flight when one key's load is heavy (expensive joins, third-party API calls, aggregate counts). SWR when p99 read latency matters more than freshness — feeds, trending lists, dashboards. XFetch when loads vary wildly in cost.
 
@@ -993,26 +751,24 @@ Symptoms: one node's CPU pinned while the rest idle; `redis-cli --hotkeys` or `O
 The most effective fix, and usually enough. Cache the hot key *in-process* with a very short TTL. Redis becomes L2.
 
 <details>
-<summary><code>app/l1.py</code> — L1 cache in front of Redis</summary>
+<summary>L1 cache in front of Redis</summary>
 
 ```python
-# app/l1.py
-import time
-from typing import Any
+l1 = {}          # in-process. key -> (expires_at, value)
+L1_TTL = 1.0     # seconds. Deliberately tiny.
 
-_l1: dict[str, tuple[float, Any]] = {}
-L1_TTL = 1.0  # seconds — deliberately tiny
+def get_with_l1(key, loader, ttl=300):
+    entry = l1.get(key)
+    if entry and entry.expires_at > now():
+        return entry.value            # never leaves the process
 
-
-async def get_with_l1(key: str, loader, ttl: int = TTL_SECONDS) -> Any:
-    now = time.monotonic()
-    hit = _l1.get(key)
-    if hit is not None and hit[0] > now:
-        return hit[1]
-
-    value = await get_single_flight(key, loader, ttl)   # §8.2
-    _l1[key] = (now + L1_TTL, value)
+    value = get_single_flight(key, loader, ttl)     # L2 = Redis (§8.2)
+    l1[key] = (now() + L1_TTL, value)
     return value
+
+# 1s L1 TTL caps Redis at ONE request per second per process for this key.
+# 50k req/s across 24 processes -> 24 req/s hitting Redis. Cost: <=1s staleness.
+# Bound the dict (LRU with a maxsize) so it cannot grow without limit.
 ```
 
 </details>
@@ -1031,20 +787,24 @@ When even L1 isn't enough, or the value must stay fresher than an L1 TTL allows:
 ```python
 HOT_REPLICAS = 16
 
+def get_split(base_key, loader, ttl=300):
+    key = f"{base_key}:{random_int(0, HOT_REPLICAS)}"   # read ONE replica
 
-async def get_split(base_key: str, loader, ttl: int = TTL_SECONDS):
-    key = f"{base_key}:{random.randrange(HOT_REPLICAS)}"
-    cached = await redis_client.get(key)
-    if cached is not None:
-        return json.loads(cached)
+    hit = cache.get(key)
+    if hit:
+        return hit
 
-    value = await loader()
-    pipe = redis_client.pipeline()
-    for i in range(HOT_REPLICAS):
-        # Jitter each replica so they don't all expire together (§8.1).
-        pipe.set(f"{base_key}:{i}", json.dumps(value), ex=ttl + random.randint(0, 30))
-    await pipe.execute()
+    value = loader()
+
+    pipe = cache.pipeline()
+    for i in range(HOT_REPLICAS):                       # write ALL replicas
+        pipe.set(f"{base_key}:{i}", value,
+                 ttl=ttl + random_between(0, 30))       # jitter each one (§8.1)
+    pipe.execute()
     return value
+
+# 16 keys -> 16 hash slots -> up to 16 nodes sharing the load.
+# Cost: 16x the memory, and invalidation must now delete 16 keys.
 ```
 
 </details>
@@ -1117,13 +877,14 @@ Two patterns that work:
 <summary>Version-prefixed keys</summary>
 
 ```python
-async def user_ns(user_id: int) -> str:
-    v = await redis_client.get(f"ver:user:{user_id}") or "0"
-    return f"user:{user_id}:v{v}"
+def user_ns(user_id):
+    version = cache.get(f"ver:user:{user_id}") or 0
+    return f"user:{user_id}:v{version}"        # the CURRENT namespace
 
 
-async def invalidate_user(user_id: int) -> None:
-    await redis_client.incr(f"ver:user:{user_id}")   # O(1), no scanning
+def invalidate_user(user_id):
+    cache.incr(f"ver:user:{user_id}")          # O(1). No scanning, no DELETE.
+    # Every old key is now unreachable and expires on its own.
 ```
 
 </details>
@@ -1136,14 +897,13 @@ Cost: orphaned keys linger until TTL, occupying memory. Fine on an `allkeys-lru`
 <summary>Tag sets</summary>
 
 ```python
-async def tag(tag_name: str, key: str) -> None:
-    await redis_client.sadd(f"tag:{tag_name}", key)
+def tag(tag_name, key):
+    cache.sadd(f"tag:{tag_name}", key)         # remember which keys carry a tag
 
 
-async def invalidate_tag(tag_name: str) -> None:
-    keys = await redis_client.smembers(f"tag:{tag_name}")
-    if keys:
-        await redis_client.delete(*keys, f"tag:{tag_name}")
+def invalidate_tag(tag_name):
+    keys = cache.smembers(f"tag:{tag_name}")
+    cache.delete(*keys, f"tag:{tag_name}")     # exact, and O(members) not O(keyspace)
 ```
 
 </details>
@@ -1171,22 +931,23 @@ Fix: cache the absence, with a short TTL.
 <summary>Negative caching with a miss sentinel</summary>
 
 ```python
-MISS_SENTINEL = "\x00"
-NEGATIVE_TTL = 30   # much shorter than positive TTL
+MISS = "<known-absent>"      # a sentinel, NOT an empty string and NOT null --
+NEGATIVE_TTL = 30            # those collide with legitimate cached values
 
-
-async def get_with_negative_cache(user_id: int) -> dict | None:
+def get_user(user_id):
     key = f"user:{user_id}"
-    cached = await redis_client.get(key)
-    if cached is not None:
-        return None if cached == MISS_SENTINEL else json.loads(cached)
 
-    row = await load_user_from_db(user_id)
+    hit = cache.get(key)
+    if hit is not None:
+        return None if hit == MISS else hit    # "known absent" vs "not looked"
+
+    row = db.query("SELECT * FROM users WHERE id = %s", user_id)
+
     if row is None:
-        await redis_client.set(key, MISS_SENTINEL, ex=NEGATIVE_TTL)
-        return None
-
-    await redis_client.set(key, json.dumps(row), ex=TTL_SECONDS)
+        cache.set(key, MISS, ttl=NEGATIVE_TTL) # short TTL: a row created a
+        return None                            # second later must not stay
+                                               # invisible for 5 minutes
+    cache.set(key, row, ttl=300)
     return row
 ```
 
